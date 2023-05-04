@@ -64,6 +64,9 @@ type Dialer struct {
 	// ClientACK defines the connection parameters requested by the client.
 	// Defaults to DefaultClientACK.
 	ClientACK *Acknowledge
+
+	// ReadDeadline defines duration for Conn read
+	ReadDeadline time.Duration
 }
 
 func (d *Dialer) Dial(ctx context.Context, endpoint string) (*Conn, error) {
@@ -83,7 +86,7 @@ func (d *Dialer) Dial(ctx context.Context, endpoint string) (*Conn, error) {
 		return nil, err
 	}
 
-	conn, err := NewConn(c.(*net.TCPConn), d.ClientACK)
+	conn, err := NewConn(c.(*net.TCPConn), d.ClientACK, d.ReadDeadline)
 	if err != nil {
 		c.Close()
 		return nil, err
@@ -174,17 +177,18 @@ type Conn struct {
 	id  uint32
 	ack *Acknowledge
 
-	closeOnce sync.Once
+	readDeadline time.Duration
+	closeOnce    sync.Once
 }
 
-func NewConn(c *net.TCPConn, ack *Acknowledge) (*Conn, error) {
+func NewConn(c *net.TCPConn, ack *Acknowledge, readDeadline time.Duration) (*Conn, error) {
 	if c == nil {
 		return nil, fmt.Errorf("no connection")
 	}
 	if ack == nil {
 		ack = DefaultClientACK
 	}
-	return &Conn{TCPConn: c, id: nextid(), ack: ack}, nil
+	return &Conn{TCPConn: c, id: nextid(), ack: ack, readDeadline: readDeadline}, nil
 }
 
 func (c *Conn) ID() uint32 {
@@ -355,6 +359,11 @@ func (c *Conn) Receive() ([]byte, error) {
 	// TODO(kung-foo): sync.Pool
 	b := make([]byte, c.ack.ReceiveBufSize)
 
+	if c.readDeadline != 0 {
+		if err := c.SetReadDeadline(time.Now().Add(c.readDeadline)); err != nil {
+			return nil, errors.Errorf("uacp: set read deadline failed: %s", err)
+		}
+	}
 	if _, err := io.ReadFull(c, b[:hdrlen]); err != nil {
 		// todo(fs): do not wrap this error since it hides io.EOF
 		// todo(fs): use golang.org/x/xerrors
@@ -370,10 +379,19 @@ func (c *Conn) Receive() ([]byte, error) {
 		return nil, errors.Errorf("uacp: message too large: %d > %d bytes", h.MessageSize, c.ack.ReceiveBufSize)
 	}
 
+	if c.readDeadline != 0 {
+		if err := c.SetReadDeadline(time.Now().Add(c.readDeadline)); err != nil {
+			return nil, errors.Errorf("uacp: set read deadline failed: %s", err)
+		}
+	}
 	if _, err := io.ReadFull(c, b[hdrlen:h.MessageSize]); err != nil {
 		// todo(fs): do not wrap this error since it hides io.EOF
 		// todo(fs): use golang.org/x/xerrors
 		return nil, err
+	}
+
+	if err := c.SetReadDeadline(time.Time{}); err != nil {
+		return nil, errors.Errorf("uacp: set read deadline failed: %s", err)
 	}
 
 	debug.Printf("uacp %d: recv %s%c with %d bytes", c.id, h.MessageType, h.ChunkType, h.MessageSize)
